@@ -15,6 +15,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import reduce, total_ordering
+from itertools import tee
 from pathlib import Path
 from types import NoneType
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
@@ -132,6 +133,21 @@ class BPENaive:
         else:
             return re.split("(" + special_token_pat + ")", text)
 
+    def _get_counts(
+        self,
+        byte_seqs: List[List[bytes]],
+        increment_dict: Dict[bytes, int] | None = None,
+    ) -> SortedDict[tuple[bytes, bytes], int]:
+        count_dict: SortedDict[tuple[bytes, bytes], int] = SortedDict()
+        if increment_dict is None:
+            increment_dict = {b"".join(seq): 1 for seq in byte_seqs}
+        for pretoken in byte_seqs:
+            for pair in zip(pretoken, pretoken[1:]):
+                count_dict[pair] = (
+                    count_dict.get(pair, 0) + increment_dict[b"".join(pretoken)]
+                )
+        return count_dict
+
     def _train(self, corpus_path: Path):
         # Initialize with bytes.
         for i in range(256):
@@ -143,35 +159,25 @@ class BPENaive:
         corpus = "".join(self._split_on_special_tokens(corpus, training=True))
         # Pre-tokenize and create count table
         text = self.pretokenizer(corpus)
-        # BUG: we count overlapping tokens, but should probably disregard (sentencepiece...)
-        # count_dict_pretoken: Dict[Tuple[int, ...], int] = {}
-        count_dict_pretoken: Dict[Tuple[bytes, ...], int] = {}
-        # count_dict_pair = Dict[tuple[int, int], int] = {}
+        count_dict_pretoken: Dict[bytes, int] = {}
         for pretoken in text:
-            token = tuple(bytes([b]) for b in pretoken.encode("utf8"))
+            token = pretoken.encode("utf8")
             if token not in count_dict_pretoken:
                 count_dict_pretoken[token] = 1
             else:
                 count_dict_pretoken[token] += 1
+        pretoken_list = list(
+            list(bytes([b]) for b in token) for token in count_dict_pretoken.keys()
+        )
+        # Count pair frequencies (initial)
+        # BUG: we count overlapping tokens, but should probably disregard (sentencepiece...)
+        count_dict = self._get_counts(pretoken_list, count_dict_pretoken)
+        # Merge main loop
         while len(self.vocab) < self.max_vocab_size:
-            # count frequencies
-            count_dict: Dict[tuple[bytes, bytes], int] = {}
-            for pretoken in count_dict_pretoken.keys():
-                for pair in zip(pretoken, pretoken[1:]):
-                    if pair not in count_dict:
-                        count_dict[pair] = count_dict_pretoken[pretoken]
-                    else:
-                        count_dict[pair] += count_dict_pretoken[pretoken]
             # Most frequent scan
-            most_frequent_pair = None
-            max_count = -1
-            for pair in sorted(
-                count_dict.keys()
-            ):  # Guarantees lexicographic merge ordering
-                count = count_dict[pair]
-                if count >= max_count:
-                    most_frequent_pair = pair
-                    max_count = count
+            most_frequent_pair, max_count = max(
+                count_dict.items(), default=(None, -1), key=lambda x: x[::-1]
+            )
             # Log merge and update vocab
             if most_frequent_pair is None:
                 # Nothing left to merge.
@@ -180,35 +186,83 @@ class BPENaive:
             with pytest.raises(KeyError):
                 print(self.vocab[len(self.vocab)])
             self.vocab[len(self.vocab)] = reduce(operator.add, most_frequent_pair)
-            # Update the pretoken count dict (manual merge)
-            # PERF: conversion to/from tuple is wasteful (array.array not hashable so need to...)
-            for pretoken in list(count_dict_pretoken):
-                new_key = list(pretoken)  # can't avoid this?
-                new_key = BPENaive._merge(new_key, most_frequent_pair)
-                new_key = tuple(new_key)  # keys need to be mutable...
-                if new_key != pretoken:
-                    count_dict_pretoken[new_key] = count_dict_pretoken[pretoken]
-                    del count_dict_pretoken[pretoken]
+            # Perform merge in our list of pretokens; update counts
+            for i, pretoken in enumerate(pretoken_list):
+                pretoken_list[i] = BPENaive._merge(
+                    pretoken,
+                    most_frequent_pair,
+                    count_dict,
+                    count_dict_pretoken[b"".join(pretoken)],
+                )
 
     @staticmethod
-    def _merge(token_seq: List[bytes], merge_pair: tuple[bytes, bytes]) -> List[bytes]:
+    def _merge(
+        old_seq: List[bytes],
+        merge_pair: tuple[bytes, bytes],
+        count_dict: SortedDict[tuple[bytes, bytes], int],
+        delta: int,
+    ) -> List[bytes]:
         ptr = 0
-        while ptr < len(token_seq) - 1:
-            byte_seq = token_seq[ptr]
-            next_byte_seq = token_seq[ptr + 1]
-            if (byte_seq, next_byte_seq) == merge_pair:
-                token_seq[ptr] = byte_seq + next_byte_seq
-                token_seq[ptr + 1 :] = token_seq[ptr + 2 :]
-                # token_seq = token_seq[:-1]
+        new_seq = []
+        just_merged = False
+        new_bytes = reduce(operator.add, merge_pair)
+        while ptr < len(old_seq):
+            if (
+                ptr < len(old_seq) - 1
+                and (old_seq[ptr], old_seq[ptr + 1]) == merge_pair
+            ):
+                # Matched the pair. Merge and update counts!
+                new_seq.append(new_bytes)
+                if ptr > 0:
+                    prev_pair = (old_seq[ptr - 1], old_seq[ptr])
+                else:
+                    prev_pair = None
+
+                # We merged: the old pair doesn't exist now
+                count_dict[merge_pair] -= delta
+                if count_dict[merge_pair] == 0:
+                    del count_dict[merge_pair]
+                if prev_pair is not None:
+                    # Remake the previous pair, since we merged
+                    count_dict[prev_pair] -= delta
+                    if count_dict[prev_pair] == 0:
+                        del count_dict[prev_pair]
+                    # If we also merged on the step before this, we need to behave slightly differently
+                    if just_merged:
+                        count_dict[(new_bytes, new_bytes)] = (
+                            count_dict.get((new_bytes, new_bytes), 0) + delta
+                        )
+                    else:
+                        count_dict[(prev_pair[0], new_bytes)] = (
+                            count_dict.get((prev_pair[0], new_bytes), 0) + delta
+                        )
+
+                # Increment the pointer
+                ptr += 2
+                just_merged = True
             else:
+                if just_merged:
+                    # backwards-looking update if the previous pair was merged
+                    prev_pair = (old_seq[ptr - 1], old_seq[ptr])
+                    count_dict[prev_pair] -= delta
+                    if count_dict[prev_pair] == 0:
+                        del count_dict[prev_pair]
+                    count_dict[(new_bytes, old_seq[ptr])] = (
+                        count_dict.get((new_bytes, old_seq[ptr]), 0) + delta
+                    )
+
+                # Keep scanning
+                new_seq.append(old_seq[ptr])
                 ptr += 1
-        return token_seq
+                just_merged = False
+        return new_seq
 
     def encode(self, text: str) -> list[int]:
         # The encoding process involves converting to utf8, then applying the merges.
         # We also need to start by treating special characters in a special way.
         text_split_special = self._split_on_special_tokens(text, training=False)
         text_encoded = []
+        merge_dict = {merge: i for i, merge in enumerate(self.merges)}
         for segment in text_split_special:
             if segment in self.special_tokens:
                 segment_encoded = segment.encode("utf8")
@@ -217,9 +271,20 @@ class BPENaive:
             else:
                 segment_pretokenized = self.pretokenizer(segment)
                 for segment in segment_pretokenized:
+                    print(segment)
                     segment_encoded = list(bytes([b]) for b in segment.encode("utf8"))
-                    for merge in self.merges:
-                        segment_encoded = BPENaive._merge(segment_encoded, merge)
+                    count_dict = self._get_counts([segment_encoded])
+                    # Karpathy fast merge algorithm
+                    while count_dict:
+                        merge_pair = min(
+                            count_dict, key=lambda p: merge_dict.get(p, float("inf"))
+                        )
+                        if merge_pair not in merge_dict:
+                            break
+                        segment_encoded = BPENaive._merge(
+                            segment_encoded, merge_pair, count_dict, 1
+                        )
+
                     tokens = [
                         self.vocab_inverse[byte_seq] for byte_seq in segment_encoded
                     ]
@@ -539,6 +604,8 @@ def test_BPE_naive():
     test_str = (
         "Hello, world! This is a test.<|STOP|>여러분들, 안녕하세요? 12,34 1 -- 3 #$@$)@"
     ) * 1
+    # test_str = '🐂'
+    # test_str= "🙃"
 
     encoded = tokenizer.encode(test_str)
     decoded = tokenizer.decode(encoded)
@@ -556,6 +623,7 @@ def test_BPE_improved():
             vocab_size,
             special_tokens=["<|endoftext|>"],
         )
+
     tokenizer = create_tokenizer()
 
     # test_str = (

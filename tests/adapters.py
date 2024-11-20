@@ -540,7 +540,7 @@ def get_tokenizer(
     """
     if special_tokens is None:
         special_tokens = []
-    tokenizer = BPEImproved(
+    tokenizer = BPENaive(
         vocab=vocab, merges=merges, special_tokens=special_tokens
     )
     return tokenizer
@@ -577,7 +577,7 @@ def run_train_bpe(
                 Merges are ordered by order of creation.
     """
     path = Path(input_path)
-    tokenizer = BPEImproved(
+    tokenizer = BPENaive(
         corpus_path=path, max_vocab_size=vocab_size, special_tokens=special_tokens
     )
     return tokenizer.vocab, tokenizer.merges

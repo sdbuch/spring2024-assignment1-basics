@@ -6,6 +6,7 @@ import heapq
 import linecache
 import operator
 import os
+import pickle
 import pprint
 import sys
 import threading
@@ -24,6 +25,7 @@ import psutil
 import pytest
 import regex as re
 from sortedcontainers import SortedDict, SortedSet
+from tqdm import tqdm
 
 # from memory_monitor import memory_tracker, track_memory
 
@@ -89,7 +91,66 @@ def pretokenizer_gpt2(text: str) -> list[str]:
     pat_str = (
         r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
     )
-    return re.findall(pat_str, text)
+    return re.findall(re.compile(pat_str), text)
+
+
+def stream_pretokenize(file_path: str, chunk_size: int = 1024 * 1024) -> Iterator[str]:
+    """
+    Stream-process a file using GPT-2 pretokenization, guaranteeing identical results
+    to processing the entire file at once.
+    """
+    pattern = re.compile(
+        r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    )
+
+    # Buffer for text that might be part of a token spanning chunks
+    buffer = ""
+
+    with open(file_path, "r") as file:
+        while True:
+            # Read next chunk and combine with buffer
+            chunk = file.read(chunk_size)
+            if not chunk and not buffer:
+                break
+
+            text = buffer + chunk
+
+            # Find all matches in current text
+            matches = pattern.finditer(text)
+            matches = list(matches)
+
+            if not matches:
+                # If no matches and we're not at EOF, buffer everything and continue
+                if chunk:
+                    buffer = text
+                    continue
+                break
+
+            if len(matches) == 1:
+                # If only one match and we're not at EOF, buffer everything and continue
+                if chunk:
+                    buffer = text
+                    continue
+                # If we're at EOF, yield the final match
+                yield matches[0].group(0)
+                break
+
+            # Yield all matches except the last one (which might be incomplete)
+            for match in matches[:-1]:
+                yield match.group(0)
+
+            # Buffer everything after the last complete match
+            last_complete_match = matches[-2]
+            buffer = text[last_complete_match.end() :]
+
+            # If we're at EOF, yield the final match and any remaining buffer
+            if not chunk:
+                if len(matches) > 1:
+                    yield matches[-1].group(0)
+                if buffer:
+                    final_matches = pattern.findall(buffer)
+                    yield from final_matches
+                break
 
 
 @dataclass
@@ -98,6 +159,7 @@ class BPENaive:
 
     corpus_path: Path = Path(".")
     max_vocab_size: int = 1024
+    serialize: bool = False
     pretokenizer: Callable = pretokenizer_gpt2
     special_tokens: List[str] = field(default_factory=list)
     vocab: Dict[int, bytes] = field(default_factory=dict)
@@ -109,6 +171,24 @@ class BPENaive:
             # We allow for vocab/merges to be passed in from a pretrained tokenizer.
             self._map_special_tokens()
             self._train(self.corpus_path)
+            if self.serialize:
+                # Write vocab and merges to disk
+                # Write a pickle for loading later + human-readable file
+                with open("vocab.txt", "w") as file:
+                    for token, string in self.vocab.items():
+                        file.write(
+                            str(token)
+                            + " : "
+                            + string.decode("utf8", errors="replace")
+                            + "\n"
+                        )
+                with open("vocab.pkl", "wb") as file:
+                    pickle.dump(self.vocab, file)
+                with open("merges.txt", "w") as file:
+                    for merge in self.merges:
+                        file.write(" ".join(map(str, merge)) + "\n")
+                with open("merges.pkl", "wb") as file:
+                    pickle.dump(self.merges, file)
         # BUG: could be a bug, not being careful...
         self.vocab_inverse = {v: k for k, v in self.vocab.items()}
 
@@ -173,7 +253,8 @@ class BPENaive:
         # BUG: we count overlapping tokens, but should probably disregard (sentencepiece...)
         count_dict = self._get_counts(pretoken_list, count_dict_pretoken)
         # Merge main loop
-        while len(self.vocab) < self.max_vocab_size:
+        for _ in tqdm(range(self.max_vocab_size - len(self.vocab) - 1)):
+            # while len(self.vocab) < self.max_vocab_size:
             # Most frequent scan
             most_frequent_pair, max_count = max(
                 count_dict.items(), default=(None, -1), key=lambda x: x[::-1]
@@ -271,7 +352,6 @@ class BPENaive:
             else:
                 segment_pretokenized = self.pretokenizer(segment)
                 for segment in segment_pretokenized:
-                    print(segment)
                     segment_encoded = list(bytes([b]) for b in segment.encode("utf8"))
                     count_dict = self._get_counts([segment_encoded])
                     # Karpathy fast merge algorithm
@@ -597,9 +677,11 @@ def measure_runtime(func):
 
 
 def test_BPE_naive():
-    corpus_path = Path("./test_data/test.txt")
-    vocab_size = 512  # 'initial' size is 256 (bytes)
-    tokenizer = BPENaive(corpus_path, vocab_size, special_tokens=["<|STOP|>"])
+    # corpus_path = Path("./test_data/test.txt")
+    # corpus_path = Path("../../data/TinyStoriesV2-GPT4-train.txt")
+    corpus_path = Path("../../data/owt_train.txt")
+    vocab_size = 32000  # 'initial' size is 256 (bytes)
+    tokenizer = BPENaive(corpus_path, vocab_size)  # , special_tokens=["<|endoftext|>"])
 
     test_str = (
         "Hello, world! This is a test.<|STOP|>여러분들, 안녕하세요? 12,34 1 -- 3 #$@$)@"
@@ -614,7 +696,8 @@ def test_BPE_naive():
 
 def test_BPE_improved():
     corpus_path = Path("../../data/TinyStoriesV2-GPT4-train.txt")
-    vocab_size = 10000  # 'initial' size is 256 (bytes)
+    # corpus_path = Path("../../data/owt_train.txt")
+    vocab_size = 32000  # 'initial' size is 256 (bytes)
 
     @measure_runtime
     def create_tokenizer():

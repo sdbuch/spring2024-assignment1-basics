@@ -8,6 +8,7 @@ import operator
 import os
 import pickle
 import pprint
+import re
 import sys
 import threading
 import time
@@ -23,7 +24,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set,
 
 import psutil
 import pytest
-import regex as re
+import regex
 from sortedcontainers import SortedDict, SortedSet
 from tqdm import tqdm
 
@@ -91,19 +92,67 @@ def pretokenizer_gpt2(text: str) -> list[str]:
     pat_str = (
         r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
     )
-    return re.findall(re.compile(pat_str), text)
+    return regex.findall(pat_str, text)
 
 
-def stream_pretokenize(file_path: str, chunk_size: int = 1024 * 1024) -> Iterator[str]:
+@dataclass
+class TokenizerMatch:
+    """Represents a match in the text, either a regular token or special token"""
+
+    text: str
+    is_special: bool
+    start: int
+    end: int
+
+
+def find_partial_special_token_match(text: str, special_tokens: List[str]) -> int:
     """
-    Stream-process a file using GPT-2 pretokenization, guaranteeing identical results
-    to processing the entire file at once.
+    Check if the end of text partially matches any special token.
+    Returns the number of additional characters needed to complete the potential match.
     """
-    pattern = re.compile(
-        r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    if not special_tokens:
+        return 0
+
+    # Sort special tokens by length in descending order
+    sorted_tokens = sorted(special_tokens, key=len, reverse=True)
+    max_token_len = len(sorted_tokens[0])
+
+    # Check for partial matches at the end of the text
+    for i in range(min(max_token_len, len(text))):
+        suffix = text[-(i + 1) :]
+        for token in sorted_tokens:
+            if token.startswith(suffix):
+                # Return how many more characters we need
+                return len(token) - len(suffix)
+    return 0
+
+
+def stream_tokenize(
+    file_path: Path,
+    special_tokens: List[str] | None = None,
+    chunk_size: int = 1024 * 1024,
+) -> Iterator[str]:
+    """
+    Stream-process a file using GPT-2 pretokenization and special token splitting.
+
+    Args:
+        file_path: Path to the file to process
+        special_tokens: List of special tokens to split on (these will be removed from output)
+        chunk_size: Size of chunks to read at once
+    """
+    special_tokens = special_tokens or []
+
+    # Base pattern for GPT-2 tokenization
+    base_pattern = re.compile(
+        r"""'(?:[sdmt]|ll|ve|re)| ?[\w]+| ?[\d]+| ?[^\s\w]+|\s+(?!\S)|\s+"""
     )
 
-    # Buffer for text that might be part of a token spanning chunks
+    # Create special token pattern
+    if special_tokens:
+        special_token_pattern = "|".join(
+            map(re.escape, sorted(special_tokens, key=len, reverse=True))
+        )
+
     buffer = ""
 
     with open(file_path, "r") as file:
@@ -115,41 +164,91 @@ def stream_pretokenize(file_path: str, chunk_size: int = 1024 * 1024) -> Iterato
 
             text = buffer + chunk
 
-            # Find all matches in current text
-            matches = pattern.finditer(text)
-            matches = list(matches)
+            if chunk:  # Only if not at EOF
+                # Handle potential contractions at the end
+                if text.endswith("'"):
+                    extra = file.read(2)
+                    text += extra
+                elif text.endswith("'", 0, -1):
+                    extra = file.read(1)
+                    text += extra
+
+                # Handle potential special tokens at the end
+                chars_needed = find_partial_special_token_match(text, special_tokens)
+                while chars_needed:
+                    extra = file.read(1)
+                    text += extra
+                    chars_needed = find_partial_special_token_match(
+                        text, special_tokens
+                    )
+
+            # First split on special tokens if any exist
+            if special_tokens:
+                segments = re.split(f"({special_token_pattern})", text)
+            else:
+                segments = [text]
+
+            # Process each segment
+            current_pos = 0
+            matches = []
+
+            for i, segment in enumerate(segments):
+                if not segment:  # Skip empty segments
+                    continue
+
+                if special_tokens and i % 2 == 1:  # This is a special token
+                    # We skip special tokens as they should be removed
+                    current_pos += len(segment)
+                    continue
+
+                # Find regular tokens in this segment
+                for match in re.finditer(base_pattern, segment):
+                    matches.append(
+                        TokenizerMatch(
+                            text=match.group(0),
+                            is_special=False,
+                            start=current_pos + match.start(),
+                            end=current_pos + match.end(),
+                        )
+                    )
+                current_pos += len(segment)
 
             if not matches:
-                # If no matches and we're not at EOF, buffer everything and continue
                 if chunk:
                     buffer = text
                     continue
                 break
 
             if len(matches) == 1:
-                # If only one match and we're not at EOF, buffer everything and continue
                 if chunk:
                     buffer = text
                     continue
-                # If we're at EOF, yield the final match
-                yield matches[0].group(0)
+                yield matches[0].text
                 break
 
-            # Yield all matches except the last one (which might be incomplete)
+            # Yield all matches except the last one
             for match in matches[:-1]:
-                yield match.group(0)
+                yield match.text
 
-            # Buffer everything after the last complete match
-            last_complete_match = matches[-2]
-            buffer = text[last_complete_match.end() :]
+            # Buffer everything after the second-to-last match
+            if len(matches) >= 2:
+                last_complete_match = matches[-2]
+                buffer = text[last_complete_match.end :]
 
-            # If we're at EOF, yield the final match and any remaining buffer
             if not chunk:
                 if len(matches) > 1:
-                    yield matches[-1].group(0)
+                    yield matches[-1].text
                 if buffer:
-                    final_matches = pattern.findall(buffer)
-                    yield from final_matches
+                    # Process any remaining buffer
+                    if special_tokens:
+                        segments = re.split(f"({special_token_pattern})", buffer)
+                    else:
+                        segments = [buffer]
+
+                    for i, segment in enumerate(segments):
+                        if not segment or (special_tokens and i % 2 == 1):
+                            continue
+                        yield from re.findall(base_pattern, segment)
                 break
 
 
@@ -160,6 +259,7 @@ class BPENaive:
     corpus_path: Path = Path(".")
     max_vocab_size: int = 1024
     serialize: bool = False
+    chunk_size: int = 2**10
     pretokenizer: Callable = pretokenizer_gpt2
     special_tokens: List[str] = field(default_factory=list)
     vocab: Dict[int, bytes] = field(default_factory=dict)
@@ -207,11 +307,11 @@ class BPENaive:
             # short circuit: empty regex breaks everything up
             return [text]
         patterns = sorted(self.special_tokens, key=len, reverse=True)
-        special_token_pat = "|".join(map(re.escape, patterns))
+        special_token_pat = "|".join(map(regex.escape, patterns))
         if training:
-            return re.split(special_token_pat, text)
+            return regex.split(special_token_pat, text)
         else:
-            return re.split("(" + special_token_pat + ")", text)
+            return regex.split("(" + special_token_pat + ")", text)
 
     def _get_counts(
         self,
@@ -228,24 +328,23 @@ class BPENaive:
                 )
         return count_dict
 
+    def _compute_pretoken_counts(
+        self, corpus_path: Path, chunk_size: int = 2**10
+    ) -> Dict[bytes, int]:
+        """Given the corpus path (for training tokenizer), pretokenize in chunks and return counts"""
+        count_dict_pretoken: Dict[bytes, int] = {}
+        for pretoken in stream_tokenize(corpus_path, self.special_tokens, chunk_size):
+            token = pretoken.encode("utf8")
+            count_dict_pretoken[token] = count_dict_pretoken.get(token, 0) + 1
+        return count_dict_pretoken
+
     def _train(self, corpus_path: Path):
         # Initialize with bytes.
         for i in range(256):
             self.vocab[i + len(self.special_tokens)] = bytes([i])
-        # Get corpus content
-        with open(corpus_path, "r") as file:
-            corpus = file.read()
-        # Strip special tokens.
-        corpus = "".join(self._split_on_special_tokens(corpus, training=True))
-        # Pre-tokenize and create count table
-        text = self.pretokenizer(corpus)
-        count_dict_pretoken: Dict[bytes, int] = {}
-        for pretoken in text:
-            token = pretoken.encode("utf8")
-            if token not in count_dict_pretoken:
-                count_dict_pretoken[token] = 1
-            else:
-                count_dict_pretoken[token] += 1
+        count_dict_pretoken = self._compute_pretoken_counts(
+            corpus_path, self.chunk_size
+        )
         pretoken_list = list(
             list(bytes([b]) for b in token) for token in count_dict_pretoken.keys()
         )
@@ -438,11 +537,11 @@ class BPEImproved:
             # short circuit: empty regex breaks everything up
             return [text]
         patterns = sorted(self.special_tokens, key=len, reverse=True)
-        special_token_pat = "|".join(map(re.escape, patterns))
+        special_token_pat = "|".join(map(regex.escape, patterns))
         if training:
-            return re.split(special_token_pat, text)
+            return regex.split(special_token_pat, text)
         else:
-            return re.split("(" + special_token_pat + ")", text)
+            return regex.split("(" + special_token_pat + ")", text)
 
     # @track_memory('training')
     def _train(self, corpus_path: Path):
@@ -454,6 +553,7 @@ class BPEImproved:
         with open(corpus_path, "r") as file:
             corpus = file.read()
         # Strip special tokens.
+        # BUG: we shouldn't rejoin...
         corpus = "".join(self._split_on_special_tokens(corpus, training=True))
         # Pre-tokenize and create count table
         # TODO: should be simplifying by counting repetitions of pretokens
@@ -678,8 +778,8 @@ def measure_runtime(func):
 
 def test_BPE_naive():
     # corpus_path = Path("./test_data/test.txt")
-    # corpus_path = Path("../../data/TinyStoriesV2-GPT4-train.txt")
-    corpus_path = Path("../../data/owt_train.txt")
+    corpus_path = Path("../../data/TinyStoriesV2-GPT4-train.txt")
+    # corpus_path = Path("../../data/owt_train.txt")
     vocab_size = 32000  # 'initial' size is 256 (bytes)
     tokenizer = BPENaive(corpus_path, vocab_size)  # , special_tokens=["<|endoftext|>"])
 
